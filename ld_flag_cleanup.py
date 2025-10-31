@@ -18,17 +18,18 @@ class LocationCollector(ast.NodeVisitor):
         keep_body = True  # Default to keeping the true branch
         
         if isinstance(node.test, ast.Call):
-            # Direct feature flag call
+            # Direct feature flag call: if feature_flag():
             if (isinstance(node.test.func, ast.Attribute) and 
                 node.test.func.attr == self.feature_flag_name):
                 is_feature_flag = True
+                keep_body = True
         elif isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not):
-            # Negated feature flag call
+            # Negated feature flag call: if not feature_flag():
             if (isinstance(node.test.operand, ast.Call) and 
                 isinstance(node.test.operand.func, ast.Attribute) and 
                 node.test.operand.func.attr == self.feature_flag_name):
                 is_feature_flag = True
-                keep_body = False  # For negated conditions, we want to remove the body
+                keep_body = False  # For negated conditions, we want the else branch
         
         if is_feature_flag:
             if_start = node.lineno - 1
@@ -44,15 +45,31 @@ class LocationCollector(ast.NodeVisitor):
                     'true_branch_start': true_branch_start,
                     'true_branch_end': true_branch_end,
                     'body': node.body,
-                    'keep_body': True
+                    'keep_body': True,
+                    'has_else': bool(node.orelse)
                 })
             else:
-                # For negated conditions with raise, remove the entire block
-                self.locations.append({
-                    'if_start': if_start,
-                    'if_end': if_end,
-                    'keep_body': False
-                })
+                # For negated conditions, keep the else branch if it exists
+                if node.orelse:
+                    else_branch_start = min(stmt.lineno - 1 for stmt in node.orelse)
+                    else_branch_end = max(stmt.end_lineno for stmt in node.orelse)
+                    self.locations.append({
+                        'if_start': if_start,
+                        'if_end': if_end,
+                        'else_branch_start': else_branch_start,
+                        'else_branch_end': else_branch_end,
+                        'orelse': node.orelse,
+                        'keep_body': False,
+                        'has_else': True
+                    })
+                else:
+                    # No else branch, remove the entire block
+                    self.locations.append({
+                        'if_start': if_start,
+                        'if_end': if_end,
+                        'keep_body': False,
+                        'has_else': False
+                    })
             
         self.generic_visit(node)    
     
@@ -106,7 +123,8 @@ def clean_flag_usage(source: str, feature_flag_name: str) -> Tuple[str, bool]:
         # Process locations in reverse order to avoid invalidating line numbers
         for loc in reversed(collector.locations):
             if loc['keep_body']:
-                # Get the indentation of the if statement
+                # Case 1: if feature_flag(): code_block_A [else: code_block_B]
+                # Keep code_block_A
                 if_indent = get_indent(lines[loc['if_start']])
                 
                 # Get the true branch lines
@@ -118,8 +136,22 @@ def clean_flag_usage(source: str, feature_flag_name: str) -> Tuple[str, bool]:
                 # Replace the entire if-else block with the adjusted true branch
                 lines[loc['if_start']:loc['if_end']] = adjusted_lines
             else:
-                # For negated conditions with raise, remove the entire block
-                lines[loc['if_start']:loc['if_end']] = []
+                # Case 2: if not feature_flag():
+                if loc['has_else']:
+                    # Keep the else branch (code_block_B)
+                    if_indent = get_indent(lines[loc['if_start']])
+                    
+                    # Get the else branch lines
+                    else_branch_lines = lines[loc['else_branch_start']:loc['else_branch_end']]
+                    
+                    # Adjust the indentation of the else branch to match the if statement's indentation
+                    adjusted_lines = adjust_indentation(else_branch_lines, if_indent)
+                    
+                    # Replace the entire if-else block with the adjusted else branch
+                    lines[loc['if_start']:loc['if_end']] = adjusted_lines
+                else:
+                    # No else branch, remove the entire block
+                    lines[loc['if_start']:loc['if_end']] = []
             
         return ''.join(lines), True
         
